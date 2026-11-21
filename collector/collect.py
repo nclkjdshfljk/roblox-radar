@@ -11,7 +11,7 @@ Roblox endpoints (no cookies, no account) and writes JSON + images into the repo
   data/media.json         icon / thumbnail versions and change history
   media/<id>-icon-<v>.webp, media/<id>-thumb-<v>.webp
 """
-import json, os, time, uuid, urllib.request, urllib.error, urllib.parse, datetime as dt
+import json, os, sys, time, uuid, urllib.request, urllib.error, urllib.parse, datetime as dt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
@@ -22,19 +22,24 @@ TS = int(NOW.timestamp())
 TODAY = NOW.strftime("%Y-%m-%d")
 KEEP_DAYS = 14
 TRACK_DAYS = 30          # keep tracking a game this long after it last showed up in a chart
-MAX_TRACKED = 1500
+MAX_TRACKED = 800
+MAX_IMAGES_PER_RUN = 240   # icons+thumbnails downloaded per run; the rest follow in later runs
+from concurrent.futures import ThreadPoolExecutor
+
+def log(*a):
+    print(*a, flush=True)
 
 
 def get(url, tries=3, raw=False):
     for i in range(tries):
         try:
             req = urllib.request.Request(url, headers=UA)
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 b = r.read()
                 return b if raw else json.loads(b)
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                time.sleep(5 * (i + 1)); continue
+                time.sleep(3 * (i + 1)); continue
             if e.code >= 500:
                 time.sleep(2 * (i + 1)); continue
             print("HTTP", e.code, url); return None
@@ -103,7 +108,7 @@ def main():
         tracked.setdefault(str(s), {"firstSeen": TODAY, "lastSeen": TODAY})
 
     charts = fetch_charts()
-    print("charts:", len(charts), [c["id"] for c in charts])
+    log("charts:", len(charts), [c["id"] for c in charts])
     in_chart = {}
     for c in charts:
         for g in c["games"]:
@@ -120,15 +125,17 @@ def main():
 
     # 2. game details + votes ------------------------------------------------
     details, votes = {}, {}
-    for part in chunks(ids, 50):
-        j = get("https://games.roblox.com/v1/games?universeIds=" + ",".join(part))
+    parts = list(chunks(ids, 50))
+    with ThreadPoolExecutor(6) as ex:
+        dj = list(ex.map(lambda p: get("https://games.roblox.com/v1/games?universeIds=" + ",".join(p)), parts))
+        vj = list(ex.map(lambda p: get("https://games.roblox.com/v1/games/votes?universeIds=" + ",".join(p)), parts))
+    for j in dj:
         for g in (j or {}).get("data", []):
             details[str(g["id"])] = g
-        v = get("https://games.roblox.com/v1/games/votes?universeIds=" + ",".join(part))
+    for v in vj:
         for g in (v or {}).get("data", []):
             votes[str(g["id"])] = g
-        time.sleep(0.3)
-    print("details:", len(details))
+    log("details:", len(details))
 
     # 3. players-online history ---------------------------------------------
     keep_from = TS - KEEP_DAYS * 86400
@@ -142,15 +149,15 @@ def main():
     groups = load(os.path.join(DATA, "groups.json"), {})
     gids = {str(g["creator"]["id"]) for g in details.values()
             if (g.get("creator") or {}).get("type") == "Group"}
-    for gid in sorted(gids):
+    todo = [g for g in sorted(gids) if not (groups.get(g, {}).get("history") or [[None]])[-1][0] == TODAY][:300]
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda gid: (gid, get(f"https://groups.roblox.com/v1/groups/{gid}", tries=2)), todo))
+    for gid, j in res:
         hist = groups.setdefault(gid, {"name": "", "history": []})
-        if hist["history"] and hist["history"][-1][0] == TODAY:
-            continue
-        j = get(f"https://groups.roblox.com/v1/groups/{gid}")
         if j and "memberCount" in j:
             hist["name"] = j.get("name", hist["name"])
             hist["history"] = (hist["history"] + [[TODAY, j["memberCount"]]])[-90:]
-        time.sleep(0.2)
+    log("groups updated:", len(res))
 
     # 5. icons and thumbnails ------------------------------------------------
     media = load(os.path.join(DATA, "media.json"), {})
@@ -168,31 +175,38 @@ def main():
             ok = [t for t in u.get("thumbnails", []) if t.get("state") == "Completed"]
             if ok:
                 thumbs[str(u["universeId"])] = ok
-    for uid in ids:
+    jobs = []  # (uid, kind, url, name, ver/ids)
+    for uid in ids:   # ids are ordered by chart recency, so the hottest games get images first
         m = media.setdefault(uid, {"icon": "", "iconVer": "", "thumb": "", "thumbIds": [], "changes": []})
         iurl = icons.get(uid)
         if iurl:
-            ver = iurl.split("/")[3][-12:] if len(iurl.split("/")) > 3 else str(TS)
+            parts_ = iurl.split("/")
+            ver = parts_[3][-12:] if len(parts_) > 3 else str(TS)
             if ver != m["iconVer"]:
-                b = get(iurl, raw=True)
-                if b:
-                    name = f"media/{uid}-icon-{ver}.webp"
-                    open(os.path.join(ROOT, name), "wb").write(b)
-                    if m["iconVer"]:
-                        m["changes"].append({"d": TODAY, "what": "icon", "old": m["icon"], "new": name})
-                    m["icon"], m["iconVer"] = name, ver
+                jobs.append((uid, "icon", iurl, f"media/{uid}-icon-{ver}.webp", ver))
         th = thumbs.get(uid)
         if th:
             tids = [str(t["targetId"]) for t in th]
             if tids != m["thumbIds"]:
-                b = get(th[0]["imageUrl"], raw=True)
-                if b:
-                    name = f"media/{uid}-thumb-{tids[0]}.webp"
-                    open(os.path.join(ROOT, name), "wb").write(b)
-                    if m["thumbIds"]:
-                        m["changes"].append({"d": TODAY, "what": "thumbnail", "old": m["thumb"], "new": name})
-                    m["thumb"], m["thumbIds"] = name, tids
+                jobs.append((uid, "thumbnail", th[0]["imageUrl"], f"media/{uid}-thumb-{tids[0]}.webp", tids))
+    jobs = jobs[:MAX_IMAGES_PER_RUN]
+    with ThreadPoolExecutor(12) as ex:
+        blobs = list(ex.map(lambda jb: get(jb[2], tries=2, raw=True), jobs))
+    for (uid, kind, url, name, ver), b in zip(jobs, blobs):
+        if not b:
+            continue
+        open(os.path.join(ROOT, name), "wb").write(b)
+        m = media[uid]
+        if kind == "icon":
+            if m["iconVer"]:
+                m["changes"].append({"d": TODAY, "what": "icon", "old": m["icon"], "new": name})
+            m["icon"], m["iconVer"] = name, ver
+        else:
+            if m["thumbIds"]:
+                m["changes"].append({"d": TODAY, "what": "thumbnail", "old": m["thumb"], "new": name})
+            m["thumb"], m["thumbIds"] = name, ver
         m["changes"] = m["changes"][-30:]
+    log("images downloaded:", sum(1 for b in blobs if b), "of", len(jobs))
 
     # 6. latest + new --------------------------------------------------------
     latest = []
@@ -234,7 +248,7 @@ def main():
     save(os.path.join(DATA, "groups.json"), groups)
     save(os.path.join(DATA, "media.json"), media)
     save(os.path.join(DATA, "tracked.json"), tracked)
-    print(f"done: {len(latest)} games, {len(new)} new in 14 days")
+    log(f"done: {len(latest)} games, {len(new)} new in 14 days")
 
 
 if __name__ == "__main__":
